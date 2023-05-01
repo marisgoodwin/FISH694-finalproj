@@ -1,0 +1,568 @@
+# Final Project Analysis 
+# Author: Maris Goodwin 
+# Note: I took some code from Mike Lee, available here: https://astrobiomike.github.io/amplicon/dada2_workflow_ex#removing-likely-contaminants
+# Title: Impact of Reference Database on Bioinformatic Pipelines 
+
+
+ # Originally, this project was going to focus on pipeline choice an how that may impact eDNA analyses. 
+ # Unfortunately, I could not get either pipeline working, so now we are going to look at the impact of reference databases on eDNA analyses 
+ # I will be comparing data provided by the company Jonah Ventures and analyses that I conducted in cutadapt, DADA2, and Insect 
+ # This code is only relevant to my bioinformatic steps, but the R analyses that I do are for both the Jonah Ventures and Insect results p
+ # I will include the Jonah Ventures steps on my Github page 
+
+# First we are going to start by creating a file that has the names of all our samples
+# my samples are named like this: JV193_UniCOI_GlassJessica_S050295.2.R2.fastq
+# the code below will remove everything after the "2", so samples will look like this: JV193_UniCOI_GlassJessica_S050295
+# create a file with all my sample names 
+ls *R1.fastq | cut -f '1 2' -d "."> samples.txt
+
+# first create an environment that we will work in and load the packages that will go in the environment
+mamba create -y -n hb-dada2-ex-wf -c conda-forge -c bioconda -c defaults \
+             cutadapt r-base rstudio r-tidyverse \
+             r-vegan r-dendextend r-viridis \
+             bioconductor-phyloseq bioconductor-deseq2 bioconductor-dada2 \
+             bioconductor-decipher bioconductor-decontam r-biocmanager \
+             r-matrix libopenblas
+
+# activate conda environment before starting analysis 
+conda activate hb-dada2-ex-wf
+# remove primers with cutadapt which we loaded before 
+cutadapt --version # 2.3 check the version is up to date 
+# test on one sample, make sure that the code is working and is actually removing forward and reverse primers 
+cutadapt -g ^GGWACWGGWTGAACWGTWTAYCCYCC \ # forward primer
+         -G ^TAIACYTCIGGRTGICCRAARAAYCA \ #reverse primer 
+         -m 180 -M 240 --discard-untrimmed \ #discard sequences that are less than 180 or greater than 382 and discard untrimmed seqs
+         -o JV194_UniCOI_GlassJessica_S050285.6.trimmed.R1.fastq -p JV194_UniCOI_GlassJessica_S050285.6.trimmed.R2.fastq \ # -o gives the forward name output and -p gives the reverse name output
+         JV194_UniCOI_GlassJessica_S050285.6.R1.fastq JV194_UniCOI_GlassJessica_S050285.6.R2.fastq # this is the files that we want the function to read in 
+# looks good so we are gonna move onto a for loop, cutadapt works on single sequences at a time so we make a loop to do it all at once 
+
+for sample in $(cat samples.txt)
+do
+
+    echo "On sample: $sample"
+    
+    cutadapt -g ^GGWACWGGWTGAACWGTWTAYCCYCC \
+         -G ^TAIACYTCIGGRTGICCRAARAAYCA \
+         -m 180 -M 240 --discard-untrimmed \
+         -o ${sample}.R1.trimmed.fastq -p ${sample}.R2.trimmed.fastq \
+         ${sample}.R1.fastq ${sample}.R2.fastq \
+         >> cutadapt_primer_trimming_stats.txt 2>&1 
+
+done
+
+# this will tell us what fraction of reads were retained in each samples (column 2) and what fraction of bp were retained in each sample (column 3)
+paste samples.txt <(grep "passing" cutadapt_primer_trimming_stats.txt | cut -f3 -d "(" | tr -d ")") <(grep "filtered" cutadapt_primer_trimming_stats.txt | cut -f3 -d "(" | tr -d ")")
+
+
+cp -r /center1/FISH694/mrgoodwin2/project/fastq/*.trimmed.fastq /center1/FISH694/mrgoodwin2/project/tourmaline/00-data # this is me copying over the fastq files to a pipeline directory to see if it would work with my newly trimmed sequences...spoiler, it did not 
+
+scp -r mrgoodwin2@chinook04.alaska.edu:/center1/FISH694/mrgoodwin2/project/tourmaline/00-data/fastq/samples.txt ~/Desktop # transfering out the names of my samples to my local computer before I realized I can do all the analysis from the command line 
+
+# Okay now we are going to use dada2 in the command line so I do not have to export all the files out of my current directory to my local computer 
+
+# first activate R in the command line by typing "R"
+R
+# install necessary packages 
+install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+install.packages("vegan", repos = "http://cran.us.r-project.org")
+install.packages("dendextend", repos = "http://cran.us.r-project.org")
+install.packages("viridis", repos = "http://cran.us.r-project.org")
+install.packages("Matrix", repos = "http://cran.us.r-project.org")
+
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager", repos = "http://cran.us.r-project.org")
+#to install several pacakges at once using BiocManger:
+# First create a list of the packages you want.
+bio_pkgs <- c("phyloseq", "DESeq2", "dada2", "decipher", "decontam", "biocmanager")
+#now install that list
+BiocManager::install(bio_pkgs)
+## first we're setting a few variables we're going to use ##
+# one with all sample names, by scanning our "samples" file we made earlier
+# ls *trimmed.fastq | cut -f '1 2' -d "."> samples.txt # this is the line that I ran , I just put it here for myself again because I was tired of scrolling up and down 
+
+ssamples <- scan("samples.txt", what="character")
+sample_name<-unique(samples)
+
+# one holding the file names of all the forward reads
+forward_reads <- paste0(samples, ".R1.trimmed.fastq")
+forward_reads<-unique(forward_reads)
+
+# and one with the reverse
+reverse_reads <- paste0(samples, ".R2.trimmed.fastq")
+reverse_reads<-unique(reverse_reads)
+
+# and variables holding file names for the forward and reverse filtered reads we're going to generate below
+filtered_forward_reads <- paste0(samples, ".R1.filtered.fastq")
+filtered_forward_reads <- unique(filtered_forward_reads)
+
+
+filtered_reverse_reads <- paste0(samples, ".R2.filtered.fastq")
+filtered_reverse_reads <- unique(filtered_reverse_reads)
+
+# Plot a subset of forward reads
+plotQualityProfile(forward_reads[17:20])
+
+# Plot a subset of reverse reads
+plotQualityProfile(reverse_reads[17:20])
+
+#In DADA2, the quality-filtering step is done with the filterAndTrim() function:
+filtered_out <- filterAndTrim(forward_reads, filtered_forward_reads,
+                              reverse_reads, filtered_reverse_reads,
+                              rm.phix=TRUE, minLen=120, truncLen=c(200,150))
+plotQualityProfile(filtered_forward_reads[17:20])
+plotQualityProfile(filtered_reverse_reads[17:20])
+
+#Run for forward and reverse reads and use the multithread=TRUE flag to use multiple cores on your PC. 
+err_forward_reads <- learnErrors(filtered_forward_reads, multithread=TRUE)
+err_reverse_reads <- learnErrors(filtered_reverse_reads, multithread=TRUE)
+
+# plot a subset of the errors
+plotErrors(err_forward_reads[17:20], nominalQ=TRUE)
+plotErrors(err_reverse_reads[17:20],nominalQ=TRUE)
+
+
+derep_forward <- derepFastq(filtered_forward_reads, verbose=TRUE)
+names(derep_forward) <- sample_name # the sample names in these objects are initially the file names of the samples, this sets them to the sample names for the rest of the workflow
+derep_reverse <- derepFastq(filtered_reverse_reads, verbose=TRUE)
+names(derep_reverse) <- sample_name
+
+
+# run dada on forward and reverse reads to infer the composition of the samples
+dada_forward <- dada(derep_forward, err=err_forward_reads, pool="pseudo", multithread=TRUE)
+
+dada_reverse <- dada(derep_reverse, err=err_reverse_reads, pool="pseudo", multithread=TRUE)
+
+# merge forward and reverse reads 
+merged_amplicons <- mergePairs(dada_forward, derep_forward, dada_reverse, derep_reverse)
+
+# make a sequence table with the merged amplicons
+seqtab <- makeSequenceTable(merged_amplicons)
+
+seqtab.nochim <- removeBimeraDenovo(seqtab, verbose=T) # Identified 667 bimeras out of 4244 input sequences.
+
+# though we only lost 667 bimeras out of 4244 input seqs sequences, we don't know if they held a lot in terms of abundance, this is one quick way to look at that
+sum(seqtab.nochim)/sum(seqtab) # 0.9797588 # barely lost any in terms of abundance
+
+# set a function
+getN <- function(x) sum(getUniques(x))
+
+# making a table that summarizes the findings 
+summary_tab <- data.frame(row.names=sample_name, dada2_input=filtered_out[,1],
+                          filtered=filtered_out[,2], dada_f=sapply(dada_forward, getN),
+                          dada_r=sapply(dada_reverse, getN), merged=sapply(merged_amplicons, getN),
+                          nonchim=rowSums(seqtab.nochim),
+                          final_perc_reads_retained=round(rowSums(seqtab.nochim)/filtered_out[,1]*100, 1))
+
+summary_tab
+# write out the table for your records 
+write.table(summary_tab, "read-count-tracking.tsv", quote=FALSE, sep="\t", col.names=NA)
+
+# transpose the table
+seqtab.nochim_trans <- as.data.frame(t(seqtab.nochim)) %>% rownames_to_column(var = "sequence") %>% 
+  rowid_to_column(var = "OTUNumber") %>% mutate(OTUNumber = sprintf("otu%04d", 
+                                                                    OTUNumber)) %>% mutate(sequence = str_replace_all(sequence, "(-|\\.)", ""))
+# create a DNAStringSet, this will make it easy for assigning taxonomy 
+seq_out <- Biostrings::DNAStringSet(df$sequence)
+
+names(seq_out) <- df$OTUNumber
+
+#Biostrings::writeXStringSet(seq_out,"ASV_no_tax.fasta"), 
+ #                           compress = FALSE, width = 20000)
+
+
+# bringing the data in so we can use it with insect 
+x <- readFASTA("/Users/marisgoodwin/Documents/GRA_stuff/Labwork/Do_not_touch/JVB1981_archive/ASV_no_tax.fasta")
+x <- readFASTA(ASV_no_tax.fasta)
+x <- char2dna(colnames(seqtab.nochim))
+
+## name the sequences sequentially
+names(x) <- paste0("ASV", seq_along(x))
+## optionally remove column names that can flood the console when printed
+colnames(seqtab.nochim) <- NULL 
+# read in the classifier, I downloaded it from this Github page: https://github.com/shaunpwilkinson/insect
+classifier <- readRDS("classifier.rds")
+classifier
+names(attributes(classifier))
+# create a longDF out of the insect results 
+longDF <- classify(x, classifier, threshold = 0.8)
+# aggregate similar taxa and their counts to create a smaller df
+taxa <- aggregate(longDF[,3:12], by= longDF["taxID"], head, 1)
+counts <- aggregate(longDF[,12:ncol(longDF)], by=longDF["taxID"], sum)
+shortDF <- merge(taxa, counts, by = "taxID")
+
+# We need to combine the taxonomic identification with samples 
+
+samples_notax <- as.data.frame(data)
+
+df$representative <- longDF$representative
+
+taxonomy <- longDF %>%
+  full_join(df,by="representative")
+
+species <- as.data.frame(unique(taxonomy$species))
+colnames(species)[colnames(species) == "unique(taxonomy$species)"] ="species" # rename the column
+
+
+# Comparing methods
+#reading in eDNA data from Jonah Ventures 
+eDNA<- read.csv("/Users/marisgoodwin/Documents/GRA_stuff/Labwork/data/JVB1981-UniCOI-read-data.csv")
+
+# pull out the unique species from JV 
+species_jonahventures <- as.data.frame(unique(eDNA$Species))
+
+colnames(species_jonahventures)[colnames(species_jonahventures) == "unique(eDNA$Species)"] ="Species" # rename the column
+
+# data frame of jonah_ventures assignments  
+newdf <- species_jonahventures %>% 
+  full_join(eDNA, by = "Species") # rows 159 to 323 have no species assignment 
+filtered_jv_dataframe <- newdf[-c(159:323),] #remove the rows that don't identify down to species 
+filtered_jv_dataframe <- filtered_jv_dataframe[,-c(2:4,11:12)] # remove columns that I am not interested in 
+jv_matrix <- filtered_jv_dataframe[,-c(2:7)]
+
+# So I had duplicate species and I wanted to aggregate the data frame by species, 
+#but I could not figure it out so eventaully
+# I just did it in excel, but below is my attempts 
+#jv<-jv_matrix %>%
+ # group_by(Species) %>% 
+  #summarize(across(S050296.10:S050276.1))
+
+#rownames(jv_matrix) <- jv_matrix[,1]
+
+
+#test_mat<-aggregate(jv_matrix,                # Specify data column
+ #         by = list(jv_matrix$Species),              # Specify group indicator
+  #        FUN = sum)
+#test_mat<- aggregate(jv_matrix, by = list(jv_matrix$Species), FUN=sum)
+
+#jv_matrix$Species <- as.integer(jv_matrix$Species)
+
+#test_mat <- aggregate(. ~ Species, jv_matrix, sum)
+
+#jv_matrix<-as.matrix(jv_matrix)
+###############################################################################
+# read in the data frame that I aggregated in excel 
+jv <- read.csv("/Users/marisgoodwin/Downloads/filtered_jv_dataframe.csv")
+jv_melt <- melt(jv)
+jv_melt<- jv_melt %>% 
+  left_join(samples_jv, by = c("variable"="sample_id"))
+jv <- as.data.frame(t(jv)) #transpose so samples are rownames and species are columns
+colnames(jv) <- jv[1,] # make the columns the names of the species
+jv <- jv[-1,] #delete the species row
+
+# data frame of INSECT assignments 
+newdf_maris <- species %>% 
+  full_join(taxonomy, by = "species") # rows 1 to 3523 have no species assignment 
+filtered_dataframe <- newdf_maris[-c(1:3523),] #remove the rows that don't identify down to species 
+filtered_dataframe <- filtered_dataframe[,-c(2:6,13:14)] #remove the columns that I am not interested in 
+
+# writing out the csv so I can do the same thing I did with the insect data 
+write.csv(filtered_dataframe,"filtered_datafrae.csv")
+
+insect <- read.csv("filtered_datafrae.csv") #read in data 
+colnames(insect) <- insect[1,]
+insect <- insect[-1,]
+insect_melt <- insect %>% 
+  spread(key = V1)
+#I want a long format dataframe which will help with plotting 
+insect_melt <- melt(insect)
+rownames(insect) <- insect[,1] #set the row names equal to species
+insect <- insect[,-1] # remove the species column
+insect <- as.data.frame(t(insect)) #transpose so species are columns and rows are samples 
+
+samples <- read.csv("samples.csv") # this has which sample_id goes with which site
+samples_jv <- read.csv("jv_samples.csv") # same as above sample_id with site
+insect_melt<- insect_melt %>% 
+  left_join(samples, by = c("variable"="sample_id"))
+
+# I want to compare the species identified from both sources 
+
+
+summary(comparedf(species, species_jonahventures)) # this shows us how different the species lists are between the data that I got from insect and the data that jonah ventures got 
+# all of the species that I identified were found in the jonah ventures except for one and then jonah ventures identified 25 other taxa 
+
+# create a barplot for the samples that we have present for each site from insect method
+ggplot(insect_melt, aes(x=site, y=value, fill=X)) +
+  geom_bar(width=0.6, stat="identity") +
+  scale_fill_viridis(discrete=TRUE) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, vjust=0.4, hjust=1), legend.title=element_blank()) +
+  labs(x="Site", y="count of COI gene copies recovered", title="Species Detections with insect package")
+
+# create a barplot for the samples that we have present for each site from jv method
+
+ggplot(jv_melt, aes(x=site.y, y=value, fill=Species)) +
+  geom_bar(width=0.6, stat="identity") +
+  scale_fill_viridis(discrete=TRUE) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, vjust=0.4, hjust=1), legend.title=element_blank()) +
+  labs(x="Site", y="count of COI gene copies recovered", title="Species Detections from Jonah Ventures")
+# I removed the columns that were not important for melting the data 
+eDNA <- eDNA[-c(1:3,11:12)]
+eDNA_melt <- melt(eDNA)
+# I wanted to joing the melted eDNA data with the samples so that I knew which sites went with which samples 
+eDNA_melt <- eDNA_melt %>% 
+  left_join(samples_jv, by = c("variable"="sample_id"))
+eDNA_melt <- eDNA_melt[-c(1:4592),] # I removed the NC 
+eDNA_melt$binary <- factor(ifelse(eDNA_melt$value>0,"1","0"))
+eDNA_melt <- eDNA_melt %>% 
+  filter(!grepl('Homo sapiens',Species))
+# I am looking at phylum detections for JV. You can change this for different taxonomic ranks by changing the fill =. Just make sure to change the title too. 
+ggplot(eDNA_melt, aes(x=site, y=binary, fill=Phylum)) +
+  geom_bar(width=0.6, stat="identity") +
+  scale_fill_viridis(discrete=TRUE) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, vjust=0.4, hjust=1), legend.title=element_blank()) +
+  labs(x="Site", y="count of COI gene copies recovered", title="Phylum Detections from Jonah Ventures")
+
+# I took the taxonomy data frame generated by insect and got rid of the columns I did not need 
+taxonomy <- taxonomy[-c(1:2,5,13:14)]
+insect_melt_long <- melt(taxonomy) # melt
+insect_melt_long <- insect_melt_long %>% 
+  left_join(samples, by = c("variable"="sample_id_tax")) # join with sample df so I know which sample goes with which site 
+
+# I am looking at phylum detections for Insect. You can change this for different taxonomic ranks by changing the fill =. Just make sure to change the title too. 
+ggplot(melted_insect, aes(x=site, y=binary, fill=phylum)) +
+  geom_bar(width=0.6, stat="identity") +
+  scale_fill_viridis(discrete=TRUE) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, vjust=0.4, hjust=1), legend.title=element_blank()) +
+  labs(x="Site", y="count of COI gene copies recovered", title="Phylum Detections with insect package")
+# just writing out the taxonomy stuff so I have it for my records 
+write.csv(taxonomy,"taxonomy.csv")
+
+# I am taking out humans and those that received no rank or no rank more than their superkingdom 
+melted_insect <- insect_melt_long %>% 
+  filter(!grepl('Homo sapiens', species))
+melted_insect <- melted_insect %>% 
+  filter(!grepl('no rank', rank))
+melted_insect <- melted_insect %>% 
+  filter(!grepl('superkingdom', rank))
+melted_insect <- melted_insect %>% 
+  filter(!grepl('NC', site)). #remove the NC 
+melted_insect$binary <- factor(ifelse(melted_insect$value>0,"1","0"))
+mat_insect_tot <- dcast(melted_insect, site~Species, value.var = 'value', fun.aggregate = sum) #create a matrix so I can do dissimalarity stuff
+
+# unmelt it 
+unmelted_insect <- melted_insect %>% 
+  pivot_wider(names_from = sample_id, values_from = value)
+
+sp_insect <- species_insect %>% 
+  left_join(melted_insect)
+  
+sp_insect<-species[species_insect == ""]<-NA                     # Replace blank by NA
+
+sp_insect <- sp_insect[-c(1:85668),] # I removed the NC 
+
+# plot the species detected by insect 
+ggplot(sp_insect, aes(x=site, y=binary, fill=species)) +
+  geom_bar(width=0.6, stat="identity") +
+  scale_fill_viridis(discrete=TRUE) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, vjust=0.4, hjust=1), legend.title=element_blank()) +
+  labs(x="Site", y="count of COI gene copies recovered", title="Species Detections with insect package")
+# removing things and joining df together for plotting species 
+sp_jv <- species_jonahventures %>% 
+  left_join(eDNA_melt)
+sp_jv <- sp_jv[-c(20067:41021),]
+sp_jv <- sp_jv %>% 
+  filter(!grepl('Homo sapiens', Species))
+ggplot(sp_jv, aes(x=site, y=binary, fill=Species)) +
+  geom_bar(width=0.6, stat="identity") +
+  scale_fill_viridis(discrete=TRUE) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, vjust=0.4, hjust=1), legend.title=element_blank()) +
+  labs(x="Site", y="count of COI gene copies recovered", title="Species Detections from Jonah Ventures")
+
+# this is how I unmelted the dataframes so that I could compare between methods 
+mat_insect <- dcast(sp_insect, sample_id~Species, value.var = 'value', fun.aggregate = sum) #create a matrix so I can do dissimalarity stuff
+mat_jv <- dcast(sp_jv, variable ~ Species, value.var = 'value', fun.aggregate = sum) # create a matrix so I can do dissimalarity stuff 
+row.names(mat_insect) <- mat_insect[,1]
+mat_insect <- mat_insect[,-1]
+row.names(mat_jv) <- mat_jv[,1]
+mat_jv <- mat_jv[,-1]
+
+jv_samples <- as.data.frame(mat_jv[,1])
+insect_samples <- as.data.frame(mat_insect[,1])
+colnames(jv_samples) <- "sample_id"
+jv_samples <- jv_samples %>% 
+  left_join(samples_jv)
+colnames(insect_samples) <- "sample_id"
+insect_samples <- insect_samples %>% 
+  left_join(samples_jv)
+
+
+colnames(sp_insect)[1] ="Species" # rename column 1 so it matches the other data matrix 
+join <- merge(sp_jv, sp_insect, by = 'Species')
+# create a data frame with the species that are similar between sampling methods 
+both_sp <- as.data.frame(unique(join$Species))
+colnames(both_sp)[colnames(both_sp) == "unique(join$Species)"] ="Species" # rename the column
+sp_insect_similar <- both_sp %>% 
+  left_join(sp_insect)
+sp_jv_similar <- both_sp %>% 
+  left_join(sp_jv)
+# plot the species similarities to see how they compare between sampling methods, this one is for jv
+ggplot(sp_jv_similar, aes(x=site, y=value, fill=Species)) +
+  geom_bar(width=0.6, stat="identity") +
+  scale_fill_viridis(discrete=TRUE) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, vjust=0.4, hjust=1), legend.title=element_blank()) +
+  labs(x="Site", y="count of COI gene copies recovered", title="Species Detections from Jonah Ventures")
+# plot the species similarities to see how they compare between sampling methods, this one is for insect
+ggplot(sp_insect_similar, aes(x=site, y=value, fill=Species)) +
+  geom_bar(width=0.6, stat="identity") +
+  scale_fill_viridis(discrete=TRUE) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, vjust=0.4, hjust=1), legend.title=element_blank()) +
+  labs(x="Site", y="count of COI gene copies recovered", title="Species Detections from insect package")
+
+# probably could have plotted the two together with a facet plot, but I like to make my life complicated.
+
+###BUBBLE PLOTS!!!####
+# this is to make a bubble plot of the similar species for insect 
+
+xx <- ggplot(sp_insect_similar, aes(x = site, y = Species)) + 
+  geom_point(aes(size = value, fill = site), alpha = 0.75, shape = 21) + 
+  #scale_size_discrete(limits = c(0,1), range = c(1,10), breaks = c(0,0.,1)) + 
+  labs( x= "", y = "", size = "Present at Site", fill = "Site")  + 
+  theme(legend.key=element_blank(), 
+        axis.text.x = element_text(colour = "black", size = 12, face = "bold", angle = 90, vjust = 0.3, hjust = 1), 
+        axis.text.y = element_text(colour = "black", face = "bold", size = 9), 
+        legend.text = element_text(size = 10, face ="bold", colour ="black"), 
+        legend.title = element_text(size = 11, face = "bold"), panel.background = element_blank(), 
+        panel.border = element_rect(colour = "black", fill = NA, size = 1.2), 
+        legend.position = "right", panel.grid.major.y = element_line(colour = "grey95"))
+xx
+
+# this is to make a bubble plot of the similar species for jv
+
+xy <- ggplot(sp_jv_similar, aes(x = site, y = Species)) + 
+  geom_point(aes(size = value, fill = site), alpha = 0.75, shape = 21) + 
+  #scale_size_discrete(limits = c(0,1), range = c(1,10), breaks = c(0,0.,1)) + 
+  labs( x= "", y = "", size = "Present at Site", fill = "Site")  + 
+  theme(legend.key=element_blank(), 
+        axis.text.x = element_text(colour = "black", size = 12, face = "bold", angle = 90, vjust = 0.3, hjust = 1), 
+        axis.text.y = element_text(colour = "black", face = "bold", size = 9), 
+        legend.text = element_text(size = 10, face ="bold", colour ="black"), 
+        legend.title = element_text(size = 11, face = "bold"), panel.background = element_blank(), 
+        panel.border = element_rect(colour = "black", fill = NA, size = 1.2), 
+        legend.position = "right", panel.grid.major.y = element_line(colour = "grey95"))
+
+xy
+
+
+# setting up the data so I can compare between sampling methods 
+sppr <- as.data.frame(specnumber(mat_insect))
+sppjv <- as.data.frame(specnumber(mat_jv))
+colnames(sppjv) <- c('specnumber','sample_id','method')
+colnames(sppr) <- c('specnumber','sample_id','method')
+sppr$site <- rownames(sppr)
+sppjv$site <- rownames(sppjv)
+sppjv$method <-rep(c('jv'),times=127)
+sppr$method <- rep(c('insect'),times=118)
+
+sppjv<-sppjv %>% left_join(jv_samples)
+sppr <- sppr %>% left_join(insect_samples)
+
+
+summary(aov(specnumber ~ site, data = sppr)) # compare whether sites are diff
+summary(aov(specnumber ~ site, data =sppjv))  # compare whether sites are diff
+# both methods show that the sites are different from each other 
+rich <- sppr %>% 
+  full_join(sppjv)
+div$test <- rep('richness',times =245)
+
+summary(aov(specnumber ~ method, data =rich))  # compare whether methods are diff, not statistically significant 
+
+
+ggplot(rich, aes(site, specnumber)) + 
+  geom_boxplot(aes(colour=site)) + 
+  theme(strip.text.x = element_text(size = 15),axis.text=element_text(size=12),
+        axis.title=element_text(size=14,face="bold"), title = element_text(size = 16, face = "bold")) +
+  labs(title="Species Richness Comparison",
+       x ="Estuarine Site", y = "Species Number")+ 
+  facet_grid(~method, labeller = as_labeller(labels)) 
+
+
+# calculate species diversity for each of the analysis methods 
+div_insect <- as.data.frame(diversity(mat_insect))
+div_jv <- as.data.frame(diversity(mat_jv))
+div_insect$sample_id <- rownames(div_insect)
+div_jv$sample_id <- rownames(div_jv)
+div_jv$method <-rep(c('jv'),times=127)
+div_insect$method <- rep(c('insect'),times=118)
+
+colnames(div_jv) <- c('value','sample_id','method')
+colnames(div_insect) <- c('value','sample_id','method')
+
+div_jv<-div_jv %>% left_join(jv_samples)
+div_insect <- div_insect %>% left_join(insect_samples)
+
+
+summary(aov(value ~ site, data = div_jv)) # compare whether sites are diff
+summary(aov(value ~ site, data =div_insect))
+# both methods show that the sites are different from each other 
+div <- div_jv %>% 
+  full_join(div_insect)
+div$test <- rep('diversity',times =245)
+summary(aov(value ~ method, data =div))  # compare whether methods are diff, statistically significant 
+
+
+ggplot(div, aes(site, value)) + 
+  geom_boxplot(aes(colour=site)) + 
+  theme(strip.text.x = element_text(size = 15),axis.text=element_text(size=12),
+        axis.title=element_text(size=14,face="bold"), title = element_text(size = 16, face = "bold")) +
+  labs(title="Shannon Diversity Comparison",
+       x ="Estuarine Site", y = "Diversity Index")+ 
+  facet_grid(~method, labeller = as_labeller(labels)) 
+
+
+# create a df with diversity and species number to plot together 
+
+together <- rich %>% 
+  full_join(div)
+
+
+# rename columns 
+
+# plot the diversity side by side 
+ggplot(diversity, aes(site, value)) + 
+  geom_point(aes(colour=site),size = 5) + 
+  theme(strip.text.x = element_text(size = 15),axis.text=element_text(size=12),
+        axis.title=element_text(size=14,face="bold"), title = element_text(size = 16, face = "bold")) +
+  labs(title="Shannon Diversity Comparison",
+       x ="Estuarine Site", y = "Diversity Index")+ 
+  facet_grid(~method, labeller = as_labeller(labels)) 
+
+ggplot(diversity, aes(x=method, y=specnumber)) + 
+  geom_boxplot() 
+facet_grid(~method, labeller = as_labeller(labels))
+
+labels <- c(insect = 'Insect', jv = 'Jonah Ventures')
+
+# to create the venn diagram, I added the seine stuff for fun, but then I realized that I would need to filter the jv and insect data by fish (which it is currently not). 
+# but this is how you would make the list if it were all fish species 
+
+fish_list <- list(Insect = unique(species_insect$species), 
+                  Jonah_Ventures = unique(species_jonahventures$Species),Seine = c("Clupea pallasii",
+                                                                                   "Eleginus gracilis","Ammodytes hexapterus",
+                                                                                   "Anoplarchus insignis",
+                                                                                   "Blepsias cirrhosus",
+                                                                                   "Enophrys bison",
+                                                                                   "Gadus macrocephalus",
+                                                                                   "Gasterosteus aculeatus",
+                                                                                   "Hemilepidotus spinosus",
+                                                                                   "Hexagrammos lagocephalus",
+                                                                                   "Hexagrammos octogrammus",
+                                                                                   "Leptocottus armatus",
+                                                                                   "Lumpenus sagitta",
+                                                                                   "Microgadus tomcod",
+                                                                                   "Myoxocephalus polyacanthocephalus",
+                                                                                   "Ophiodon elongatus",
+                                                                                   "Pholis laeta",
+                                                                                   "Platichthys stellatus",
+                                                                                   "Psettichthys melanostictus",
+                                                                                   "Salvelinus malma"))
+venn <- ggVennDiagram(fish_list,show_intersect = T,label_size = 10) 
+
+venn
+
