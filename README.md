@@ -14,8 +14,8 @@ First we are going to start by creating a file that has the names of all our sam
 my samples are named like this: JV193_UniCOI_GlassJessica_S050295.2.R2.fastq
 the code below will remove everything after the "2", so samples will look like this: JV193_UniCOI_GlassJessica_S050295
 
-# The code that I ran can be found in Final_analysis_694
+The code that I ran can be found in Final_analysis_694
 
-# the remainder of the items are figures that I made with the data 
+The remainder of the items are figures that I made with the data 
 
-# If you would like access to the raw data, email me at: mrgoodwin2@alaska.edu
+If you would like access to the raw data, email me at: mrgoodwin2@alaska.edu
